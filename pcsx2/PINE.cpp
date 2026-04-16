@@ -12,6 +12,8 @@
 #include "common/Error.h"
 #include "common/Threading.h"
 
+#include "CDVD/CDVDcommon.h"
+
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -159,7 +161,14 @@ namespace PINEServer
 		MsgUUID = 0xD, /**< Returns the game UUID. */
 		MsgGameVersion = 0xE, /**< Returns the game verion. */
 		MsgStatus = 0xF, /**< Returns the emulator status. */
-		MsgUnimplemented = 0xFF /**< Unimplemented IPC message. */
+		MsgUnimplemented = 0xFF, /**< Unimplemented IPC message. */
+	 	MsgReset = 0x10, /**< Reset the virtual machine */
+		MsgLoadDisc = 0x11, /**< Load current physical disc. */
+		MsgUnloadDisc = 0x12, /**< Unload current physical disc. */
+		MsgShowFPS = 0x13, /**< Shows the number of internal video frames displayed per second by the system */
+		MsgEjectCard1 = 0x14, /**< Ejects the first memory card. */
+		MsgEjectCard2 = 0x15, /**< Ejects the second memory card. */
+		MsgShutdownVM = 0x67 /**< Shuts down the virtual machine. */
 	};
 
 	/**
@@ -388,27 +397,18 @@ bool PINEServer::AcceptClient()
 	{
 		// Gross C-style cast, but SOCKET is a handle on Windows.
 		Console.WriteLn("PINE: New client with FD %d connected.", (int)s_msgsock);
-		return true;
-	}
-
 #ifdef __APPLE__
 	int nosigpipe = 1;
 	setsockopt(s_msgsock, SOL_SOCKET, SO_NOSIGPIPE, &nosigpipe, sizeof(nosigpipe));
 #endif
+		
+		return true;
+	}
 
 	// everything else is non recoverable in our scope
 	// we also mark as recoverable socket errors where it would block a
 	// non blocking socket, even though our socket is blocking, in case
 	// we ever have to implement a non blocking socket.
-#ifdef _WIN32
-	const int errno_w = WSAGetLastError();
-	if (!(errno_w == WSAECONNRESET || errno_w == WSAEINTR || errno_w == WSAEINPROGRESS || errno_w == WSAEMFILE || errno_w == WSAEWOULDBLOCK) && s_sock != INVALID_SOCKET)
-		Console.Error("PINE: accept() returned error %d", errno_w);
-#else
-	if (!(errno == ECONNABORTED || errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) && s_sock >= 0)
-		Console.Error("PINE: accept() returned error %d", errno);
-#endif
-
 	return false;
 }
 
@@ -453,9 +453,9 @@ void PINEServer::ClientLoop()
 			// if we got at least the final size then update
 			if (end_length == 4 && receive_length >= 4)
 			{
-				end_length = FromSpan<u32>(ipc_buffer_span, 0);
+				end_length = FromSpan<u32>(ipc_buffer_span, 0) + 4;  // ADD 4 to include the size field itself
 				// we'd like to avoid a client trying to do OOB
-				if (end_length > MAX_IPC_SIZE || end_length < 4)
+				if (end_length > MAX_IPC_SIZE || end_length < 5)  // (4-byte size + 1-byte command)
 				{
 					receive_length = 0;
 					break;
@@ -510,6 +510,7 @@ void PINEServer::Deinitialize()
 
 PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8>& ret_buffer, u32 buf_size)
 {
+	Console.WriteLn("PINE: ParseCommand called with buf_size=%d", buf_size);  
 	u32 ret_cnt = 5;
 	u32 buf_cnt = 0;
 
@@ -531,6 +532,49 @@ PINEServer::IPCBuffer PINEServer::ParseCommand(std::span<u8> buf, std::vector<u8
 		// reply: XX ZZ ZZ ZZ ZZ
 		switch ((IPCCommand)buf[buf_cnt - 1])
 		{
+			case MsgReset:    
+			{    
+				Console.WriteLn("PINE: Received Reset Command.");  
+				if (!VMManager::HasValidVM())    
+					goto error;    
+				if (!SafetyChecks(buf_cnt, 0, ret_cnt, 0, buf_size)) [[unlikely]]    
+					goto error;    
+				Host::RunOnCPUThread([] { VMManager::Reset(); });    
+				break;    
+			}
+			case MsgUnloadDisc:    
+			{    
+				Console.WriteLn("PINE: Received Unload Disc Command.");  
+				if (!VMManager::HasValidVM())    
+					goto error;    
+				if (!SafetyChecks(buf_cnt, 0, ret_cnt, 0, buf_size)) [[unlikely]]    
+					goto error;    
+
+				Host::RunOnCPUThread([] { VMManager::ChangeDisc(CDVD_SourceType::NoDisc, ""); });    
+				break;    
+			}
+			case MsgLoadDisc:    
+			{    
+				Console.WriteLn("PINE: Received Load Disc Command.");  
+				if (!VMManager::HasValidVM())    
+					goto error;    
+				if (!SafetyChecks(buf_cnt, 0, ret_cnt, 0, buf_size)) [[unlikely]]    
+					goto error;    
+
+				Host::RunOnCPUThread([] { VMManager::ChangeDisc(CDVD_SourceType::Disc, ""); });    
+				break;    
+			}
+			case MsgShutdownVM:    
+			{    
+				Console.WriteLn("PINE: Received Shutdown VM Command.");  
+				if (!VMManager::HasValidVM())    
+					goto error;    
+				if (!SafetyChecks(buf_cnt, 0, ret_cnt, 0, buf_size)) [[unlikely]]    
+					goto error;    
+
+				Host::RunOnCPUThread([] { VMManager::Internal::CPUThreadShutdown(); });    
+				break;    
+			}
 			case MsgRead8:
 			{
 				if (!VMManager::HasValidVM())
